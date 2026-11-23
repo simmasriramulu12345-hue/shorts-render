@@ -1,2 +1,2 @@
 # shorts-render
-Dileep Explains Shorts render lane
+Shorts render runners (code only; media lives in R2)
