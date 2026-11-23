@@ -1,0 +1,137 @@
+name: shorts-chunked
+
+run-name: ${{ inputs.short }} (${{ inputs.prefix }})
+
+# one Short at a time on this account: the matrix alone takes ~19 of the 20 runner slots
+concurrency: { group: shorts-chunked, cancel-in-progress: false }
+
+# Dileep Explains: ONE Short rendered by ~20 GitHub runners at once (23 Nov 2026 test, CPU only).
+#   plan     : word timing once + face windows -> one matrix entry per 16-frame LatentSync segment
+#   chunk    : each runner lip-syncs ONE segment (LatentSync 1.5, 12 steps + DeepCache, seed 1247) -> R2
+#   assemble : joins the segments per face window, seam check, then the normal assembly (shorts_render.py assemble) -> R2
+# Job (R2 keys only) = <prefix>/jobs/<short>.json, made on the laptop by gh_job.py. The owner's face, voice and clips are only
+# fetched from R2 at run time; results go back to R2 <prefix>/<short>/. No artifacts, nothing private printed (public repo + logs).
+
+on:
+
+  workflow_dispatch:
+
+    inputs:
+
+      short:  { description: 'job name in R2, e.g. korea_age_te_split', required: true }
+      prefix: { description: 'R2 work prefix under s2work/shorts1/ (gh_test = test, gh_prod = production: final video -> out/)', required: false, default: 'gh_test' }
+
+env:
+
+  CF_R2_ENDPOINT: ${{ secrets.CF_R2_ENDPOINT }}
+  CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+  CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+  JOB_PREFIX: ${{ inputs.prefix }}
+  SHORT: ${{ inputs.short }}
+
+jobs:
+
+  plan:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    outputs:
+
+      matrix: ${{ steps.plan.outputs.matrix }}
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with: { python-version: '3.10' }
+
+      - name: tools
+
+        run: |
+          case "$SHORT" in *[!a-z0-9_]*|'') echo "bad short name"; exit 1;; esac
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg > /dev/null
+          pip install -q uv
+          uv pip install -q --system torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -q --system transformers==4.48.0 numpy==1.26.4 uroman soundfile boto3
+
+      - id: plan
+
+        name: plan
+
+        run: python shorts_chunk.py plan "$SHORT"
+
+  chunk:
+
+    needs: plan
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 120
+
+    strategy:
+
+      fail-fast: false
+
+      max-parallel: 20
+
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with: { python-version: '3.10' }
+
+      - name: tools
+
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg > /dev/null
+          pip install -q uv
+          uv pip install -q --system torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+          uv pip install -q --system diffusers==0.32.2 transformers==4.48.0 decord==0.6.0 accelerate==0.26.1 einops==0.7.0 omegaconf==2.3.0 \
+            opencv-python==4.9.0.80 mediapipe==0.10.11 python_speech_features==0.6 librosa==0.10.1 scenedetect==0.6.1 ffmpeg-python==0.2.0 \
+            imageio==2.31.1 imageio-ffmpeg==0.5.1 lpips==0.1.4 face-alignment==1.4.1 huggingface-hub==0.30.2 numpy==1.26.4 kornia==0.8.0 \
+            insightface==0.7.3 onnxruntime==1.21.0 DeepCache==0.1.1 boto3
+
+      - name: window ${{ matrix.n }} segment ${{ matrix.s }}
+
+        run: python shorts_chunk.py chunk "$SHORT" "${{ matrix.n }}" "${{ matrix.s }}"
+
+  assemble:
+
+    needs: [plan, chunk]
+
+    if: ${{ always() && needs.plan.result == 'success' }}
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+
+        with: { python-version: '3.10' }
+
+      - name: tools
+
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ffmpeg fonts-liberation > /dev/null
+          pip install -q uv
+          uv pip install -q --system boto3 pillow numpy==1.26.4
+
+      - name: join segments + seam check
+
+        run: python shorts_chunk.py join "$SHORT"
+
+      - name: assemble the Short
+
+        run: python shorts_render.py "$SHORT" assemble
