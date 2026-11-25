@@ -13,6 +13,9 @@ from botocore.config import Config
 S3 = boto3.client("s3", endpoint_url=os.environ["CF_R2_ENDPOINT"], aws_access_key_id=os.environ["CF_R2_ACCESS_KEY_ID"],
                   aws_secret_access_key=os.environ["CF_R2_SECRET_ACCESS_KEY"], region_name="auto", config=Config(signature_version="s3v4"))
 JOB = json.loads(S3.get_object(Bucket=BUCKET, Key=f"s2work/shorts1/{PREFIX}/jobs/{NAME}.json")["Body"].read())
+TR = JOB.get("tr") == "shorts_v1" and not JOB.get("kit")   # 25 Nov (owner OK): Nitish's short transitions for NEW Shorts only (shorts_tr.py)
+if TR:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import shorts_tr as STR
 OUT = JOB["out"]; assert OUT.startswith(f"s2work/shorts1/{PREFIX}/"), "work files never go outside the gh_ prefix"
 # production (prefix gh_prod, owner 23 Nov): ONLY the two finished videos go where Kaggle renders land, out/sh_<name>.mp4 + _720.mp4.
 # Guard: the keys must be exactly this Short's own keys and must not exist yet (a GitHub run never overwrites any Short).
@@ -197,7 +200,9 @@ for k, beats in enumerate(JOB["beats"]):
         used[bt["clip"]] = at + L
         shots.append({"src": src, "cl": cl, "at": min(at, max(0, cl - L - 0.05)), "t0": a + i * L, "L": L, "move": bt.get("move", random.choice(["in", "out"])),
                       "hit": bt.get("hit", False), "whoosh": i == 0 and k > 0, "label": bt.get("label")})
+        if TR: shots[-1]["tr_word"] = bt.get("trw")
 print("shots", len(shots), "avg len", round(D / len(shots), 2), flush=True)
+if TR: STR.plan(shots, D, log=lambda *a: print(*a, flush=True))
 parts = []
 for i, s in enumerate(shots):
     L = s["L"]; z = 0.09
@@ -207,9 +212,16 @@ for i, s in enumerate(shots):
     if avail < L:
         f = min(1.5, L / avail); fill = f"setpts={f:.4f}*(PTS-STARTPTS),"
         if avail * f < L - 0.05: fill += "split[fw][bw];[bw]reverse[rv];[fw][rv]concat=n=2:v=1:a=0,"
-    vf = (f"{fill}fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,tpad=stop_mode=clone:stop_duration=0.3,"
-          f"scale=w='trunc(1080*({zexp})/2)*2':h='trunc(1920*({zexp})/2)*2':eval=frame,crop=1080:1920:x='{xexp}':y='(ih-oh)/2',"
-          f"eq=contrast=1.07:saturation=1.10:gamma=0.98,vignette=angle=PI/5,trim=duration={L:.3f}")
+    if TR:   # transitions live inside this shot's head (cut INTO it) and tail (cut OUT of it): length and join unchanged
+        zexp = f"({zexp}){STR.zoom_mult(s.get('tr'))}"
+        hd = ",".join(x for x in (STR.head(s.get("tr"), direction=s.get("tr_dir", 1)) if i else "", STR.tail(s.get("tr_out"), L)) if x)
+        vf = (f"{fill}fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,tpad=stop_mode=clone:stop_duration=0.3,"
+              f"scale=w='trunc(1080*({zexp})/2)*2':h='trunc(1920*({zexp})/2)*2':eval=frame,crop=1080:1920:x='{xexp}':y='(ih-oh)/2',"
+              + (hd + "," if hd else "") + f"setsar=1,eq=contrast=1.07:saturation=1.10:gamma=0.98,vignette=angle=PI/5,trim=duration={L:.3f}")
+    else:
+        vf = (f"{fill}fps=30,scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,tpad=stop_mode=clone:stop_duration=0.3,"
+              f"scale=w='trunc(1080*({zexp})/2)*2':h='trunc(1920*({zexp})/2)*2':eval=frame,crop=1080:1920:x='{xexp}':y='(ih-oh)/2',"
+              f"eq=contrast=1.07:saturation=1.10:gamma=0.98,vignette=angle=PI/5,trim=duration={L:.3f}")
     sh(f"ffmpeg -y -loglevel error -ss {s['at']:.3f} -t {avail:.3f} -i {s['src']} -vf \"{vf}\" -an -c:v libx264 -crf 16 -preset veryfast -pix_fmt yuv420p {T}/s{i:03d}.mp4", quiet=True)
     parts.append(f"{T}/s{i:03d}.mp4")
 open(f"{T}/list.txt", "w").write("\n".join(f"file '{p}'" for p in parts))
@@ -218,6 +230,11 @@ print("background", dur(f"{T}/bg.mp4"), flush=True)
 sh(f"ffmpeg -y -loglevel error -f lavfi -i 'anoisesrc=c=pink:d=0.55:a=0.6' -af 'highpass=f=500,lowpass=f=6000,afade=t=in:d=0.38:curve=exp,afade=t=out:st=0.38:d=0.17,volume=0.5' -ar 48000 -ac 2 {T}/whoosh.wav")
 sh(f"ffmpeg -y -loglevel error -f lavfi -i 'sine=f=52:d=0.9' -f lavfi -i 'anoisesrc=c=brown:d=0.25:a=0.8' -filter_complex '[0]afade=t=out:st=0.05:d=0.85:curve=exp,volume=1.6[s];[1]lowpass=f=300,afade=t=out:d=0.25[n];[s][n]amix=inputs=2:normalize=0' -ar 48000 -ac 2 {T}/hit.wav")
 sfx = [(s["t0"] - 0.3, "whoosh") for s in shots if s["whoosh"]] + [(s["t0"], "hit") for s in shots if s["hit"]]
+if TR:   # transition SFX (whoosh / hit / glitch crackle); no double whoosh on a cut that already has one
+    sh(f"ffmpeg -y -loglevel error -f lavfi -i '{STR.GLITCH_WAV[0]}' -af '{STR.GLITCH_WAV[1]}' -ar 48000 -ac 2 {T}/glitch.wav")
+    sfx = [(t, k) for t, k in sfx if k != "hit"]
+    have = {round(t, 2) for t, k in sfx if k == "whoosh"}
+    sfx += [(t, k) for t, k in STR.sfx(shots) if not (k == "whoosh" and round(t, 2) in have)]
 from PIL import Image, ImageDraw, ImageFont
 FONT = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"   # the font the Kaggle renders use
 if not os.path.exists(FONT): FONT = next(iter(glob.glob("/usr/share/fonts/**/*Bold*.ttf", recursive=True)), None)
